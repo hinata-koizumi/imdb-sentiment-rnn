@@ -13,8 +13,8 @@ ENV/
 *.pth
 *.pt
 
-# Data output
-data/output/*
+# Data
+data/
 
 # IDE
 .vscode/
