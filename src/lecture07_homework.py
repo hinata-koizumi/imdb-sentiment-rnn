@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 from torch.optim.lr_scheduler import OneCycleLR
@@ -13,7 +12,7 @@ from sklearn.model_selection import train_test_split
 import pandas as pd
 from typing import List
 import time
-import os
+import copy
 
 # --- パス設定 ---
 CURRENT_FILE = Path(__file__).resolve()
@@ -24,23 +23,38 @@ OUTPUT_DIR = ROOT_DIR / 'data' / 'output'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- シード固定 ---
-seed = 42
-torch.manual_seed(seed)
-np.random.seed(seed)
-random.seed(seed)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+SEEDS = [42, 2025, 777, 1234]
+DATA_SPLIT_SEED = 42
+set_seed(SEEDS[0])
 
 # --- データ読み込み ---
 x_train = np.load(DATA_DIR / 'x_train.npy', allow_pickle=True)
 t_train = np.load(DATA_DIR / 't_train.npy', allow_pickle=True)
-x_train, x_valid, t_train, t_valid = train_test_split(x_train, t_train, test_size=0.2, random_state=seed)
+x_train, x_valid, t_train, t_valid = train_test_split(x_train, t_train, test_size=0.1, random_state=DATA_SPLIT_SEED)
 x_test = np.load(DATA_DIR / 'x_test.npy', allow_pickle=True)
 
 def text_transform(text: List[int], max_length=512):
-    text = text[:max_length - 1] + [2]
+    # EOS を付ける前に、「EOS抜きの最大長」を決める
+    max_len_no_eos = max_length - 1  # 例: 512 -> 511
+    if len(text) > max_len_no_eos:
+        # 先頭と末尾を半分ずつ残す
+        head_len = max_len_no_eos // 2
+        tail_len = max_len_no_eos - head_len
+        # [先頭 head_len トークン] + [末尾 tail_len トークン]
+        text = text[:head_len] + text[-tail_len:]
+    # 最後に EOS (id=2) を付与
+    text = text + [2]
+    # 実際の長さ（EOS込み）を返す
     return text, len(text)
 
 def collate_batch(batch):
@@ -177,111 +191,122 @@ max_lr = 1.5e-3
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 log(f"Device: {device}")
 
-net = SequenceTaggingNet(word_num, emb_dim, hid_dim, num_layers=2, dropout=0.3)
-net.to(device)
-
-optimizer = optim.AdamW(net.parameters(), lr=max_lr, weight_decay=1e-4) # Weight Decay強め
-criterion = nn.BCEWithLogitsLoss()
-
-steps_per_epoch = len(x_train) // batch_size + 1
-scheduler = OneCycleLR(
-    optimizer,
-    max_lr=max_lr,
-    epochs=n_epochs,
-    steps_per_epoch=steps_per_epoch,
-    pct_start=0.2,
-    anneal_strategy='cos'
-)
-
-best_valid_f1 = -1.0
-best_model_path = OUTPUT_DIR / 'best_model_final.pth'
-
 # DataLoader
 train_dataloader = DataLoader([(t, x) for t, x in zip(t_train, x_train)], batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
 valid_dataloader = DataLoader([(t, x) for t, x in zip(t_valid, x_valid)], batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
 test_dataloader = DataLoader(x_test, batch_size=batch_size, shuffle=False, collate_fn=collate_batch)
+steps_per_epoch = len(train_dataloader)
 
 def smooth_labels(labels, smoothing=0.05):
     return labels * (1 - smoothing) + 0.5 * smoothing
 
-for epoch in range(n_epochs):
-    epoch_start = time.time()
-    losses_train = []
-    
-    net.train()
-    t_train_epoch, y_train_epoch = [], []
-    
-    for label, line, len_seq in train_dataloader:
-        t = label.to(device).float()
-        x = line.to(device)
-        len_seq = len_seq.to(device)
-        
-        t_smooth = smooth_labels(t, smoothing=0.05)
+all_test_probs = []
 
-        optimizer.zero_grad()
-        logits = net(x, None, len_seq)
-        loss = criterion(logits, t_smooth)
-        loss.backward()
-        nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
+for seed in SEEDS:
+    log(f"===== SEED {seed} =====")
+    set_seed(seed)
 
-        with torch.no_grad():
-            preds = torch.sigmoid(logits).round()
-            t_train_epoch.extend(t.cpu().tolist())
-            y_train_epoch.extend(preds.cpu().tolist())
-        losses_train.append(loss.item())
+    net = SequenceTaggingNet(word_num, emb_dim, hid_dim, num_layers=2, dropout=0.3)
+    net.to(device)
 
-    # Valid
-    losses_valid = []
-    t_valid_epoch, y_pred_valid = [], []
-    net.eval()
-    for label, line, len_seq in valid_dataloader:
-        t = label.to(device).float()
-        x = line.to(device)
-        len_seq = len_seq.to(device)
-        with torch.no_grad():
+    optimizer = optim.AdamW(net.parameters(), lr=max_lr, weight_decay=1e-4)  # Weight Decay強め
+    criterion = nn.BCEWithLogitsLoss()
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=max_lr,
+        epochs=n_epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.2,
+        anneal_strategy='cos'
+    )
+
+    best_valid_f1 = -1.0
+    best_state_dict = None
+
+    for epoch in range(n_epochs):
+        epoch_start = time.time()
+        losses_train = []
+
+        net.train()
+        t_train_epoch, y_train_epoch = [], []
+
+        for label, line, len_seq in train_dataloader:
+            t = label.to(device).float()
+            x = line.to(device)
+            len_seq = len_seq.to(device)
+
+            t_smooth = smooth_labels(t, smoothing=0.05)
+
+            optimizer.zero_grad()
             logits = net(x, None, len_seq)
-            loss = criterion(logits, t)
-            pred = torch.sigmoid(logits).round()
-        
-        t_valid_epoch.extend(t.cpu().tolist())
-        y_pred_valid.extend(pred.cpu().tolist())
-        losses_valid.append(loss.item())
+            loss = criterion(logits, t_smooth)
+            loss.backward()
+            nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
 
-    train_f1 = f1_score(t_train_epoch, y_train_epoch, average='macro')
-    valid_f1 = f1_score(t_valid_epoch, y_pred_valid, average='macro')
-    epoch_time = time.time() - epoch_start
-    avg_train_loss = float(np.mean(losses_train))
-    avg_valid_loss = float(np.mean(losses_valid))
-    
-    log(f"[Epoch {epoch+1:02d}/{n_epochs}] {epoch_time:.1f}s")
-    log(f"  Train -> Loss: {avg_train_loss:.3f}, F1: {train_f1:.3f}")
-    log(f"  Valid -> Loss: {avg_valid_loss:.3f}, F1: {valid_f1:.3f}, Best: {max(best_valid_f1, valid_f1):.3f}")
+            with torch.no_grad():
+                preds = torch.sigmoid(logits).round()
+                t_train_epoch.extend(t.cpu().tolist())
+                y_train_epoch.extend(preds.cpu().tolist())
+            losses_train.append(loss.item())
 
-    if valid_f1 > best_valid_f1:
-        best_valid_f1 = valid_f1
-        torch.save(net.state_dict(), best_model_path)
-        log(f"    -> Saved Best Model! (F1: {valid_f1:.3f})")
+        # Valid
+        losses_valid = []
+        t_valid_epoch, y_pred_valid = [], []
+        net.eval()
+        for label, line, len_seq in valid_dataloader:
+            t = label.to(device).float()
+            x = line.to(device)
+            len_seq = len_seq.to(device)
+            with torch.no_grad():
+                logits = net(x, None, len_seq)
+                loss = criterion(logits, t)
+                pred = torch.sigmoid(logits).round()
 
-# 推論
-log(f"Loading best model: {best_valid_f1:.3f}")
-if best_model_path.exists():
-    net.load_state_dict(torch.load(best_model_path))
-net.eval()
+            t_valid_epoch.extend(t.cpu().tolist())
+            y_pred_valid.extend(pred.cpu().tolist())
+            losses_valid.append(loss.item())
 
-y_pred_test = []
-for _, line, len_seq in test_dataloader:
-    x = line.to(device)
-    len_seq = len_seq.to(device)
+        train_f1 = f1_score(t_train_epoch, y_train_epoch, average='macro')
+        valid_f1 = f1_score(t_valid_epoch, y_pred_valid, average='macro')
+        epoch_time = time.time() - epoch_start
+        avg_train_loss = float(np.mean(losses_train))
+        avg_valid_loss = float(np.mean(losses_valid))
+
+        log(f"[Epoch {epoch+1:02d}/{n_epochs}] {epoch_time:.1f}s")
+        log(f"  Train -> Loss: {avg_train_loss:.3f}, F1: {train_f1:.3f}")
+        log(f"  Valid -> Loss: {avg_valid_loss:.3f}, F1: {valid_f1:.3f}, Best: {max(best_valid_f1, valid_f1):.3f}")
+
+        if valid_f1 > best_valid_f1:
+            best_valid_f1 = valid_f1
+            best_state_dict = copy.deepcopy(net.state_dict())
+            log(f"    -> New Best Model! (F1: {valid_f1:.3f})")
+
+    log(f"[SEED {seed}] Best Valid F1: {best_valid_f1:.4f}")
+
+    if best_state_dict is None:
+        raise RuntimeError(f"No best state captured for seed {seed}.")
+
+    net.load_state_dict(best_state_dict)
+    net.eval()
+    probs_list = []
     with torch.no_grad():
-        logits = net(x, None, len_seq)
-        y = torch.sigmoid(logits)
-    pred = y.round().squeeze()
-    y_pred_test.extend(pred.tolist())
+        for _, line, len_seq in test_dataloader:
+            x = line.to(device)
+            len_seq = len_seq.to(device)
+            logits = net(x, None, len_seq)
+            y = torch.sigmoid(logits)  # 確率
+            probs_list.append(y.cpu())
+    test_probs = torch.cat(probs_list).numpy()  # shape: [10000]
+    all_test_probs.append(test_probs)
+
+# それぞれの seed の確率を平均
+ensemble_probs = np.mean(all_test_probs, axis=0)
+# しきい値は一旦シンプルに 0.5 のまま
+y_pred_test = (ensemble_probs > 0.5).astype(int)
 
 submission = pd.Series(y_pred_test, name='label')
-submission_path = OUTPUT_DIR / 'submission_pred_final_v2.csv'
+submission_path = OUTPUT_DIR / 'submission_seed_ensemble.csv'
 submission.to_csv(submission_path, header=True, index_label='id')
 log(f"Done. Submission saved.")
-
