@@ -9,10 +9,7 @@
 
 ## Overview
 
-Classification of Fashion-MNIST (10 classes), the fashion version of MNIST, using a Multi-Layer Perceptron.
-
-For details about Fashion-MNIST, please refer to the following link:  
-Fashion-MNIST: https://github.com/zalandoresearch/fashion-mnist
+Sentiment analysis on IMDb movie reviews using RNN
 
 ## Rules
 
